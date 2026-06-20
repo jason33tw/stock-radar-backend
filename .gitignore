@@ -1,0 +1,21 @@
+# 環境變數（含機密 token，絕對不能上傳）
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 資料庫檔案（本機 SQLite，不需要上傳）
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
