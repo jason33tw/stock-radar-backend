@@ -193,6 +193,7 @@ def format_flex_message(stocks: list, target_date: str) -> list:
     # ── 標題泡泡 ──
     header_bubble = {
         "type": "bubble",
+        "size": "kilo",
         "body": {
             "type": "box",
             "layout": "vertical",
