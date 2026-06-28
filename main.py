@@ -7,7 +7,9 @@ import logging
 from datetime import datetime
 
 from database import init_db
+from database_us import init_us_db
 from routers import stocks, analysis, notifications, scheduler, debug
+from routers import us_stocks
 from config import settings
 
 logging.basicConfig(
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await init_us_db()
     logger.info("Database initialized")
     yield
     logger.info("Application shutting down")
@@ -45,6 +48,7 @@ app.include_router(analysis.router,      prefix="/api/analysis",      tags=["分
 app.include_router(notifications.router, prefix="/api/notifications",  tags=["通知"])
 app.include_router(scheduler.router,     prefix="/api/scheduler",     tags=["排程"])
 app.include_router(debug.router,         prefix="/api/debug",         tags=["除錯"])
+app.include_router(us_stocks.router,     prefix="/api/us-stocks",     tags=["美股"])
 
 
 @app.get("/")

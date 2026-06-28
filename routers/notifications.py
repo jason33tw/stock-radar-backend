@@ -12,17 +12,8 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────
-#  LINE Messaging API 發送函式（支援 Flex Message）
-# ─────────────────────────────────────────────
 async def send_line_message(messages: list, broadcast: bool = True) -> dict:
-    """
-    支援任意 LINE message 格式（text / flex）
-    broadcast=True  → 廣播給所有好友
-    broadcast=False → 單點推送至 LINE_TARGET_ID
-    """
     token = settings.LINE_CHANNEL_ACCESS_TOKEN
-
     if not token:
         return {"success": False, "error": "LINE_CHANNEL_ACCESS_TOKEN 未設定"}
 
@@ -42,7 +33,7 @@ async def send_line_message(messages: list, broadcast: bool = True) -> dict:
         payload = {"to": to.strip(), "messages": messages}
 
     try:
-        logger.info(f"🎯 發送 {'廣播' if broadcast else '單點'} 訊息...")
+        logger.info(f"發送 {'廣播' if broadcast else '單點'} 訊息...")
         async with httpx.AsyncClient(follow_redirects=False) as client:
             response = await client.post(url, headers=headers, json=payload, timeout=10.0)
             if response.status_code == 200:
@@ -55,30 +46,27 @@ async def send_line_message(messages: list, broadcast: bool = True) -> dict:
         return {"success": False, "error": str(e)}
 
 
-# ─────────────────────────────────────────────
-#  Flex Message 格式化（股票可點擊連結）
-# ─────────────────────────────────────────────
 def build_stock_bubble(i: int, s: dict) -> dict:
-    """產生單一股票的 Flex Bubble"""
-    score     = s.get("score", 0)
-    name      = s.get("stock_name", "")
-    sid       = s.get("stock_id", "")
-    close     = s.get("close_price", 0)
-    bd        = s.get("score_breakdown", {})
-    fdays     = s.get("foreign_consecutive_buy", 0)
-    tdays     = s.get("trust_consecutive_buy", 0)
-    vr        = s.get("volume_ratio", 0)
-    goodinfo_url = f"https://goodinfo.tw/tw/StockDetail.php?STOCK_ID={sid}"
+    score = s.get("score", 0)
+    name  = s.get("stock_name", "")
+    sid   = s.get("stock_id", "")
+    close = s.get("close_price", 0)
+    bd    = s.get("score_breakdown", {})
+    fdays = s.get("foreign_consecutive_buy", 0)
+    tdays = s.get("trust_consecutive_buy", 0)
+    vr    = s.get("volume_ratio", 0)
+    # 修正：副檔名改為 .asp
+    goodinfo_url = f"https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={sid}"
 
-    # 分數顏色
     score_color = "#E53935" if score >= 80 else "#FB8C00" if score >= 60 else "#43A047"
 
-    # 原因標籤
     reasons = []
     if bd.get("foreign_consecutive_buy_5") or bd.get("foreign_consecutive_buy_3"):
         reasons.append(f"外資連買{fdays}天")
     if bd.get("trust_consecutive_buy_5") or bd.get("trust_consecutive_buy_3"):
         reasons.append(f"投信連買{tdays}天")
+    if bd.get("dual_institution_resonance"):
+        reasons.append("法人共振")
     if bd.get("is_60d_high"):
         reasons.append("創60日新高")
     if bd.get("volume_ratio_200") and vr:
@@ -86,24 +74,7 @@ def build_stock_bubble(i: int, s: dict) -> dict:
     if bd.get("margin_decrease"):
         reasons.append("融資減少")
 
-    reason_components = [
-        {
-            "type": "text",
-            "text": r,
-            "size": "xs",
-            "color": "#ffffff",
-            "wrap": False,
-            "adjustMode": "shrink-to-fit",
-            "flex": 0,
-            "margin": "sm",
-            "decoration": "none",
-            "style": "normal",
-            # 小標籤背景用 box 包裝，見下方
-        }
-        for r in reasons
-    ]
-
-    # 標籤 box 列表
+    # 標籤 box — 修正：移除 box 上不支援的 wrap 屬性
     tag_boxes = [
         {
             "type": "box",
@@ -119,6 +90,37 @@ def build_stock_bubble(i: int, s: dict) -> dict:
         for r in reasons
     ]
 
+    body_contents = [
+        {
+            "type": "button",
+            "action": {
+                "type": "uri",
+                "label": f"{sid} {name}",
+                "uri": goodinfo_url,
+            },
+            "style": "primary",
+            "color": "#1565C0",
+            "height": "sm",
+            "margin": "none",
+        },
+        {
+            "type": "text",
+            "text": f"收盤價　${close:.1f}",
+            "size": "sm",
+            "color": "#555555",
+            "margin": "md",
+        },
+    ]
+
+    # 修正：標籤容器移除 wrap，改為單純 horizontal box
+    if tag_boxes:
+        body_contents.append({
+            "type": "box",
+            "layout": "horizontal",
+            "contents": tag_boxes,
+            "margin": "md",
+        })
+
     return {
         "type": "bubble",
         "size": "kilo",
@@ -126,21 +128,8 @@ def build_stock_bubble(i: int, s: dict) -> dict:
             "type": "box",
             "layout": "horizontal",
             "contents": [
-                {
-                    "type": "text",
-                    "text": f"#{i}",
-                    "size": "sm",
-                    "color": "#888888",
-                    "flex": 0,
-                },
-                {
-                    "type": "text",
-                    "text": f"{score}分",
-                    "size": "sm",
-                    "color": score_color,
-                    "align": "end",
-                    "weight": "bold",
-                },
+                {"type": "text", "text": f"#{i}", "size": "sm", "color": "#888888", "flex": 0},
+                {"type": "text", "text": f"{score}分", "size": "sm", "color": score_color, "align": "end", "weight": "bold"},
             ],
             "paddingAll": "12px",
             "paddingBottom": "4px",
@@ -148,49 +137,14 @@ def build_stock_bubble(i: int, s: dict) -> dict:
         "body": {
             "type": "box",
             "layout": "vertical",
-            "contents": [
-                # 股票名稱（可點擊）
-                {
-                    "type": "button",
-                    "action": {
-                        "type": "uri",
-                        "label": f"{sid} {name}",
-                        "uri": goodinfo_url,
-                    },
-                    "style": "primary",
-                    "color": "#1565C0",
-                    "height": "sm",
-                    "margin": "none",
-                },
-                # 收盤價
-                {
-                    "type": "text",
-                    "text": f"收盤價　${close:.1f}",
-                    "size": "sm",
-                    "color": "#555555",
-                    "margin": "md",
-                },
-                # 原因標籤
-                *(
-                    [{
-                        "type": "box",
-                        "layout": "horizontal",
-                        "contents": tag_boxes,
-                        "margin": "md",
-                        "wrap": True,
-                    }]
-                    if tag_boxes else []
-                ),
-            ],
+            "contents": body_contents,
             "paddingAll": "12px",
         },
     }
 
 
 def format_flex_message(stocks: list, target_date: str) -> list:
-    """回傳完整 LINE messages list（header carousel + stock carousel）"""
-
-    # ── 標題泡泡 ──
+    # 修正：header bubble 加上 size kilo，與 stock bubble 統一
     header_bubble = {
         "type": "bubble",
         "size": "kilo",
@@ -201,15 +155,13 @@ def format_flex_message(stocks: list, target_date: str) -> list:
                 {"type": "text", "text": "📡 台股法人飆股雷達", "weight": "bold", "size": "lg"},
                 {"type": "text", "text": f"📅 {target_date}", "size": "sm", "color": "#888888", "margin": "sm"},
                 {"type": "separator", "margin": "md"},
-                {"type": "text", "text": f"🏆 今日 TOP{len(stocks)} 潛力飆股", "size": "sm", "margin": "md", "color": "#333333"},
+                {"type": "text", "text": f"🏆 今日 TOP{len(stocks)} 潛力飆股", "size": "sm", "margin": "md", "color": "#43A047"},
             ],
         },
     }
 
-    # ── 股票泡泡列表 ──
     stock_bubbles = [build_stock_bubble(i, s) for i, s in enumerate(stocks[:10], 1)]
 
-    # 全部放進同一個 Carousel
     carousel = {
         "type": "flex",
         "altText": f"📡 台股法人飆股雷達 {target_date} TOP{len(stocks)}",
@@ -222,15 +174,11 @@ def format_flex_message(stocks: list, target_date: str) -> list:
     return [carousel]
 
 
-# ─────────────────────────────────────────────
-#  API 路由
-# ─────────────────────────────────────────────
 @router.post("/send-daily")
 async def send_daily_notification(
     min_score: int = 50,
     db: AsyncSession = Depends(get_db),
 ):
-    """發送每日 TOP 潛力股通知 (LINE Flex Message + Goodinfo 連結)"""
     result = await db.execute(select(func.max(StockDailyData.date)))
     target_date = result.scalar_one_or_none()
     if not target_date:
@@ -281,7 +229,6 @@ async def send_daily_notification(
 
 @router.post("/test")
 async def test_notification():
-    """發送測試通知（含 Goodinfo 連結）"""
     test_stocks = [{
         "stock_id":                "2330",
         "stock_name":              "台積電",
@@ -293,7 +240,7 @@ async def test_notification():
         "volume_ratio":            2.3,
     }]
     messages = format_flex_message(test_stocks, "2025-01-01")
-    result   = await send_line_message(messages, broadcast=True)
+    result = await send_line_message(messages, broadcast=True)
     return {
         "success": result["success"],
         "message": "測試訊息已發送，請查看 LINE ✅" if result["success"] else f"發送失敗：{result.get('error')}",
