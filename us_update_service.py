@@ -1,26 +1,26 @@
 """
-美股資料更新服務 v3
-資料來源：yfinance download()（批次抓取，被限流機率低於逐支 Ticker.history）
+美股資料更新服務 v4
+資料來源：Alpha Vantage API（穩定、不受地區 IP 限制）
+免費方案：每分鐘 25 次請求，每天 500 次
 評分邏輯：技術面（MA、量比、RSI、動能、新高）
 """
 import asyncio
 import json
 import logging
 import time
-import random
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
-import concurrent.futures
 
+import httpx
 from sqlalchemy import select, and_
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
 from database_us import UsStock, UsStockDaily
 
 logger = logging.getLogger(__name__)
-logging.getLogger("yfinance").setLevel(logging.ERROR)
-logging.getLogger("urllib3").setLevel(logging.ERROR)
+
+ALPHA_VANTAGE_KEY = "ZBNL9JL5RJ6ZJSRD"
+AV_BASE = "https://www.alphavantage.co/query"
 
 DEFAULT_US_WATCHLIST = [
     ("AAPL",  "蘋果",         "Technology"),
@@ -150,119 +150,158 @@ def calculate_us_score(data: dict) -> tuple:
     return total, json.dumps(breakdown, ensure_ascii=False)
 
 
-def _fetch_batch_sync(symbols: list, name_map: dict, sector_map: dict) -> dict:
-    """
-    用 yfinance.download() 批次抓多支股票歷史資料
-    被限流機率遠低於逐支 Ticker.history()
-    回傳 {symbol: data_dict}
-    """
-    import yfinance as yf
-
-    results = {}
-    symbols_str = " ".join(symbols)
-
+async def _fetch_av(symbol: str, client: httpx.AsyncClient) -> Optional[dict]:
+    """用 Alpha Vantage TIME_SERIES_DAILY 抓取日線資料"""
     try:
-        df = yf.download(
-            tickers=symbols_str,
-            period="1y",
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-        )
+        resp = await client.get(AV_BASE, params={
+            "function":   "TIME_SERIES_DAILY",
+            "symbol":     symbol,
+            "outputsize": "full",
+            "apikey":     ALPHA_VANTAGE_KEY,
+        }, timeout=30)
+
+        data = resp.json()
+
+        if "Note" in data:
+            logger.warning(f"[{symbol}] AV rate limit: {data['Note']}")
+            return None
+
+        if "Information" in data:
+            logger.warning(f"[{symbol}] AV info: {data['Information']}")
+            return None
+
+        ts = data.get("Time Series (Daily)")
+        if not ts:
+            logger.error(f"[{symbol}] no time series in response")
+            return None
+
+        # 排序日期（最新在前）
+        sorted_dates = sorted(ts.keys(), reverse=True)
+        if len(sorted_dates) < 20:
+            logger.warning(f"[{symbol}] too few data points: {len(sorted_dates)}")
+            return None
+
+        # 取最近 252 個交易日
+        sorted_dates = sorted_dates[:252]
+        # 反轉成由舊到新，方便計算 MA
+        sorted_dates.reverse()
+
+        closes  = [float(ts[d]["4. close"])  for d in sorted_dates]
+        opens   = [float(ts[d]["1. open"])   for d in sorted_dates]
+        highs   = [float(ts[d]["2. high"])   for d in sorted_dates]
+        lows    = [float(ts[d]["3. low"])    for d in sorted_dates]
+        volumes = [float(ts[d]["5. volume"]) for d in sorted_dates]
+
+        def ma(lst, n):
+            if len(lst) < n:
+                return None
+            return round(sum(lst[-n:]) / n, 4)
+
+        close_today = closes[-1]
+        ma5         = ma(closes, 5)
+        ma20        = ma(closes, 20)
+        ma60        = ma(closes, 60)
+        avg_vol20   = ma(volumes, 20)
+        vol_today   = volumes[-1]
+        vol_ratio   = round(vol_today / avg_vol20, 2) if avg_vol20 else 0
+        is_60d_high = close_today >= max(closes[-60:]) if len(closes) >= 60 else False
+        is_52w_high = close_today >= max(closes) if len(closes) >= 200 else False
+        rsi14       = _calculate_rsi(closes)
+        change_pct  = round((closes[-1] - closes[-2]) / closes[-2] * 100, 2) if len(closes) >= 2 else 0
+        mom3        = round((closes[-1] - closes[-4]) / closes[-4] * 100, 2) if len(closes) >= 4 else 0
+
+        logger.info(f"[{symbol}] OK close={close_today} vr={vol_ratio} rsi={rsi14}")
+
+        return {
+            "symbol":           symbol,
+            "date":             sorted_dates[-1],
+            "open_price":       round(opens[-1], 4),
+            "close_price":      round(close_today, 4),
+            "high_price":       round(highs[-1], 4),
+            "low_price":        round(lows[-1], 4),
+            "change_pct":       change_pct,
+            "volume":           vol_today,
+            "avg_volume20":     avg_vol20,
+            "volume_ratio":     vol_ratio,
+            "ma5":              ma5,
+            "ma20":             ma20,
+            "ma60":             ma60,
+            "is_60d_high":      is_60d_high,
+            "is_52w_high":      is_52w_high,
+            "rsi14":            rsi14,
+            "inst_own_pct":     None,
+            "short_ratio":      None,
+            "short_pct_float":  None,
+            "price_momentum_3": mom3,
+        }
+
     except Exception as e:
-        logger.error(f"yfinance.download failed: {e}")
-        return results
+        logger.error(f"[{symbol}] fetch error: {e}")
+        return None
 
-    if df is None or df.empty:
-        logger.error("yfinance.download returned empty DataFrame")
-        return results
 
-    # 多支股票時 columns 是 MultiIndex (field, symbol)
-    # 單支股票時 columns 是 (field,)
-    is_multi = isinstance(df.columns, object) and hasattr(df.columns, 'levels')
+async def _save_one(symbol: str, name: str, sector: str, data: dict) -> bool:
+    score, score_bd = calculate_us_score(data)
 
-    for symbol in symbols:
+    async with AsyncSessionLocal() as db:
         try:
-            if len(symbols) == 1:
-                closes  = df["Close"].dropna().tolist()
-                volumes = df["Volume"].dropna().tolist()
-                opens   = df["Open"].dropna().tolist()
-                highs   = df["High"].dropna().tolist()
-                lows    = df["Low"].dropna().tolist()
-                dates   = [str(d.date()) for d in df.index]
+            target_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
+            result = await db.execute(
+                select(UsStockDaily).where(
+                    and_(
+                        UsStockDaily.symbol == symbol,
+                        UsStockDaily.date   == target_date,
+                    )
+                )
+            )
+            existing = result.scalar_one_or_none()
+            row_data = dict(
+                symbol          = symbol,
+                date            = target_date,
+                open_price      = data["open_price"],
+                close_price     = data["close_price"],
+                high_price      = data["high_price"],
+                low_price       = data["low_price"],
+                change_pct      = data["change_pct"],
+                volume          = data["volume"],
+                avg_volume20    = data["avg_volume20"],
+                volume_ratio    = data["volume_ratio"],
+                ma5             = data["ma5"],
+                ma20            = data["ma20"],
+                ma60            = data["ma60"],
+                is_60d_high     = data["is_60d_high"],
+                is_52w_high     = data["is_52w_high"],
+                rsi14           = data["rsi14"],
+                inst_own_pct    = data["inst_own_pct"],
+                short_ratio     = data["short_ratio"],
+                short_pct_float = data["short_pct_float"],
+                score           = score,
+                score_breakdown = score_bd,
+            )
+            if existing:
+                for k, v in row_data.items():
+                    setattr(existing, k, v)
             else:
-                if symbol not in df["Close"].columns:
-                    continue
-                closes  = df["Close"][symbol].dropna().tolist()
-                volumes = df["Volume"][symbol].dropna().tolist()
-                opens   = df["Open"][symbol].dropna().tolist()
-                highs   = df["High"][symbol].dropna().tolist()
-                lows    = df["Low"][symbol].dropna().tolist()
-                # 日期用 Close 不是 NaN 的對應行
-                idx = df["Close"][symbol].dropna().index
-                dates = [str(d.date()) for d in idx]
+                db.add(UsStockDaily(**row_data))
 
-            if len(closes) < 10:
-                logger.warning(f"[{symbol}] not enough data: {len(closes)} rows")
-                continue
+            # 確保 us_stocks 基本資料存在
+            sr = await db.execute(select(UsStock).where(UsStock.symbol == symbol))
+            if not sr.scalar_one_or_none():
+                db.add(UsStock(symbol=symbol, name=name, sector=sector))
 
-            def ma(lst, n):
-                if len(lst) < n:
-                    return None
-                return round(sum(lst[-n:]) / n, 4)
-
-            close_today = closes[-1]
-            ma5         = ma(closes, 5)
-            ma20        = ma(closes, 20)
-            ma60        = ma(closes, 60)
-            avg_vol20   = ma(volumes, 20)
-            vol_today   = volumes[-1]
-            vol_ratio   = round(vol_today / avg_vol20, 2) if avg_vol20 else 0
-            is_60d_high = close_today >= max(closes[-60:]) if len(closes) >= 60 else False
-            is_52w_high = close_today >= max(closes[-252:]) if len(closes) >= 252 else False
-            rsi14       = _calculate_rsi(closes)
-            change_pct  = round((closes[-1] - closes[-2]) / closes[-2] * 100, 2) if len(closes) >= 2 else 0
-            mom3        = round((closes[-1] - closes[-4]) / closes[-4] * 100, 2) if len(closes) >= 4 else 0
-
-            results[symbol] = {
-                "symbol":           symbol,
-                "name":             name_map.get(symbol, symbol),
-                "sector":           sector_map.get(symbol, ""),
-                "date":             dates[-1],
-                "open_price":       round(opens[-1], 4),
-                "close_price":      round(close_today, 4),
-                "high_price":       round(highs[-1], 4),
-                "low_price":        round(lows[-1], 4),
-                "change_pct":       change_pct,
-                "volume":           vol_today,
-                "avg_volume20":     avg_vol20,
-                "volume_ratio":     vol_ratio,
-                "ma5":              ma5,
-                "ma20":             ma20,
-                "ma60":             ma60,
-                "is_60d_high":      is_60d_high,
-                "is_52w_high":      is_52w_high,
-                "rsi14":            rsi14,
-                "inst_own_pct":     None,
-                "short_ratio":      None,
-                "short_pct_float":  None,
-                "price_momentum_3": mom3,
-            }
-            logger.info(f"[{symbol}] OK close={close_today} vr={vol_ratio}")
-
+            await db.commit()
+            return True
         except Exception as e:
-            logger.error(f"[{symbol}] parse error: {e}")
-
-    return results
+            logger.error(f"DB save error [{symbol}]: {e}")
+            await db.rollback()
+            return False
 
 
 class UsUpdateService:
     def __init__(self):
         self.is_running = False
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-    async def sync_us_stock_list(self, db: AsyncSession) -> int:
+    async def sync_us_stock_list(self, db) -> int:
         count = 0
         for symbol, name, sector in DEFAULT_US_WATCHLIST:
             result = await db.execute(select(UsStock).where(UsStock.symbol == symbol))
@@ -272,67 +311,6 @@ class UsUpdateService:
         await db.commit()
         return count
 
-    async def _save_one(self, data: dict) -> bool:
-        symbol = data["symbol"]
-        score, score_bd = calculate_us_score(data)
-
-        async with AsyncSessionLocal() as db:
-            try:
-                target_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
-                result = await db.execute(
-                    select(UsStockDaily).where(
-                        and_(
-                            UsStockDaily.symbol == symbol,
-                            UsStockDaily.date   == target_date,
-                        )
-                    )
-                )
-                existing = result.scalar_one_or_none()
-                row_data = dict(
-                    symbol          = symbol,
-                    date            = target_date,
-                    open_price      = data["open_price"],
-                    close_price     = data["close_price"],
-                    high_price      = data["high_price"],
-                    low_price       = data["low_price"],
-                    change_pct      = data["change_pct"],
-                    volume          = data["volume"],
-                    avg_volume20    = data["avg_volume20"],
-                    volume_ratio    = data["volume_ratio"],
-                    ma5             = data["ma5"],
-                    ma20            = data["ma20"],
-                    ma60            = data["ma60"],
-                    is_60d_high     = data["is_60d_high"],
-                    is_52w_high     = data["is_52w_high"],
-                    rsi14           = data["rsi14"],
-                    inst_own_pct    = data["inst_own_pct"],
-                    short_ratio     = data["short_ratio"],
-                    short_pct_float = data["short_pct_float"],
-                    score           = score,
-                    score_breakdown = score_bd,
-                )
-                if existing:
-                    for k, v in row_data.items():
-                        setattr(existing, k, v)
-                else:
-                    db.add(UsStockDaily(**row_data))
-
-                # 確保 us_stocks 基本資料存在
-                sr = await db.execute(select(UsStock).where(UsStock.symbol == symbol))
-                if not sr.scalar_one_or_none():
-                    db.add(UsStock(
-                        symbol=symbol,
-                        name=data["name"],
-                        sector=data["sector"],
-                    ))
-
-                await db.commit()
-                return True
-            except Exception as e:
-                logger.error(f"DB save error [{symbol}]: {e}")
-                await db.rollback()
-                return False
-
     async def run_daily_update(self) -> dict:
         if self.is_running:
             return {"status": "already_running"}
@@ -341,7 +319,7 @@ class UsUpdateService:
         success, error = 0, 0
 
         try:
-            # 確保股票清單已存在
+            # 確保股票清單存在
             async with AsyncSessionLocal() as db:
                 result = await db.execute(select(UsStock).where(UsStock.is_active == True))
                 stocks = result.scalars().all()
@@ -354,32 +332,31 @@ class UsUpdateService:
             sector_map = {s.symbol: s.sector  for s in stocks}
             symbols    = [s.symbol for s in stocks]
 
-            # 分批次，每批 8 支，批次之間稍作等待
-            batch_size = 8
-            for i in range(0, len(symbols), batch_size):
-                batch = symbols[i:i + batch_size]
-                logger.info(f"Fetching batch {i//batch_size + 1}: {batch}")
-
-                loop = asyncio.get_running_loop()
-                batch_results = await loop.run_in_executor(
-                    self._executor,
-                    _fetch_batch_sync,
-                    batch,
-                    name_map,
-                    sector_map,
-                )
-
-                for symbol, data in batch_results.items():
-                    ok = await self._save_one(data)
-                    if ok:
-                        success += 1
+            # Alpha Vantage 免費版：每分鐘 25 次
+            # 每支請求之間間隔 2.5 秒，確保不超限
+            async with httpx.AsyncClient() as client:
+                for i, symbol in enumerate(symbols):
+                    data = await _fetch_av(symbol, client)
+                    if data:
+                        ok = await _save_one(
+                            symbol,
+                            name_map.get(symbol, symbol),
+                            sector_map.get(symbol, ""),
+                            data,
+                        )
+                        if ok:
+                            success += 1
+                        else:
+                            error += 1
                     else:
                         error += 1
 
-                error += len(batch) - len(batch_results)
-
-                if i + batch_size < len(symbols):
-                    await asyncio.sleep(random.uniform(3, 6))
+                    # 每 25 支暫停 65 秒，確保不超過每分鐘 25 次限制
+                    if (i + 1) % 25 == 0 and i + 1 < len(symbols):
+                        logger.info("AV rate limit pause: 65s")
+                        await asyncio.sleep(65)
+                    else:
+                        await asyncio.sleep(2.5)
 
         except Exception as e:
             logger.error(f"US daily update failed: {e}")
