@@ -156,7 +156,7 @@ async def _fetch_av(symbol: str, client: httpx.AsyncClient) -> Optional[dict]:
         resp = await client.get(AV_BASE, params={
             "function":   "TIME_SERIES_DAILY",
             "symbol":     symbol,
-            "outputsize": "full",
+            "outputsize": "compact",
             "apikey":     ALPHA_VANTAGE_KEY,
         }, timeout=30)
 
@@ -205,7 +205,7 @@ async def _fetch_av(symbol: str, client: httpx.AsyncClient) -> Optional[dict]:
         vol_today   = volumes[-1]
         vol_ratio   = round(vol_today / avg_vol20, 2) if avg_vol20 else 0
         is_60d_high = close_today >= max(closes[-60:]) if len(closes) >= 60 else False
-        is_52w_high = close_today >= max(closes) if len(closes) >= 200 else False
+        is_52w_high = close_today >= max(closes) if len(closes) >= 80 else False
         rsi14       = _calculate_rsi(closes)
         change_pct  = round((closes[-1] - closes[-2]) / closes[-2] * 100, 2) if len(closes) >= 2 else 0
         mom3        = round((closes[-1] - closes[-4]) / closes[-4] * 100, 2) if len(closes) >= 4 else 0
