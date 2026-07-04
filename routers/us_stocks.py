@@ -173,7 +173,7 @@ async def test_av_connection():
                     "function": "TIME_SERIES_DAILY",
                     "symbol": "AAPL",
                     "outputsize": "compact",
-                    "apikey": "ZBNL9JL5RJ6ZJSRD",
+                    "apikey": "9D50FDF0FBGY7R1H",
                 },
                 timeout=30,
             )

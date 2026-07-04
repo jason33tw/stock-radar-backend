@@ -19,7 +19,14 @@ from database_us import UsStock, UsStockDaily
 
 logger = logging.getLogger(__name__)
 
-ALPHA_VANTAGE_KEY = "ZBNL9JL5RJ6ZJSRD"
+ALPHA_VANTAGE_KEYS = ["ZBNL9JL5RJ6ZJSRD", "9D50FDF0FBGY7R1H"]
+_key_index = 0
+
+def _get_next_key():
+    global _key_index
+    key = ALPHA_VANTAGE_KEYS[_key_index % len(ALPHA_VANTAGE_KEYS)]
+    _key_index += 1
+    return key
 AV_BASE = "https://www.alphavantage.co/query"
 
 DEFAULT_US_WATCHLIST = [
@@ -157,7 +164,7 @@ async def _fetch_av(symbol: str, client: httpx.AsyncClient) -> Optional[dict]:
             "function":   "TIME_SERIES_DAILY",
             "symbol":     symbol,
             "outputsize": "compact",
-            "apikey":     ALPHA_VANTAGE_KEY,
+            "apikey": _get_next_key(),
         }, timeout=30)
 
         data = resp.json()
