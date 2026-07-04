@@ -159,3 +159,33 @@ async def search_us_stocks(
         .limit(20)
     )
     return [{"symbol": s.symbol, "name": s.name} for s in result.scalars().all()]
+
+
+@router.get("/debug/av-test")
+async def test_av_connection():
+    """測試 Alpha Vantage 連線（診斷用）"""
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://www.alphavantage.co/query",
+                params={
+                    "function": "TIME_SERIES_DAILY",
+                    "symbol": "AAPL",
+                    "outputsize": "compact",
+                    "apikey": "ZBNL9JL5RJ6ZJSRD",
+                },
+                timeout=30,
+            )
+            data = resp.json()
+            keys = list(data.keys())
+            has_data = "Time Series (Daily)" in data
+            dates_count = len(data.get("Time Series (Daily)", {}))
+            return {
+                "status": "ok" if has_data else "error",
+                "response_keys": keys,
+                "dates_count": dates_count,
+                "raw_preview": str(data)[:500],
+            }
+    except Exception as e:
+        return {"status": "exception", "error": str(e)}
