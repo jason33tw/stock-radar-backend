@@ -19,7 +19,7 @@ from database_us import UsStock, UsStockDaily
 
 logger = logging.getLogger(__name__)
 
-ALPHA_VANTAGE_KEYS = [ "9D50FDF0FBGY7R1H"]
+ALPHA_VANTAGE_KEYS = ["9D50FDF0FBGY7R1H"]
 _key_index = 0
 
 def _get_next_key():
